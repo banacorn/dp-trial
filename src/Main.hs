@@ -5,6 +5,8 @@ module Main where
 import qualified    Data.Text.IO as T
 import qualified    Data.Text as T
 import              Data.Text (Text)
+import              Data.Text.Encoding (encodeUtf8)
+
 import qualified    Data.ByteString.Lazy as B
 import              Data.ByteString.Lazy (ByteString)
 import qualified    Data.Map as Map
@@ -12,6 +14,8 @@ import              Data.Map (Map)
 import qualified    Data.Vector as V
 import              Data.Vector (Vector)
 import              Data.Maybe (maybeToList)
+import              Data.Csv
+import              Data.Monoid
 
 import              Parser
 import              Type
@@ -21,8 +25,12 @@ import              System.Random.MWC
 import              Statistics.Distribution
 import              Statistics.Distribution.Laplace
 
+type County a = Map Text a
+type District a = Map Text (County a)
+type FlatDistrict a = Map Text a
 
-
+iteration :: Int
+iteration = 1000
 
 main :: IO ()
 main = do
@@ -30,75 +38,154 @@ main = do
     case parse raw of
         Left err -> putStrLn err
         Right rows -> do
-            let mapping = buildMapping rows
-
-            putStrLn "全國平均就醫距離"
-            pprint (nationwideAvg mapping)
-
-            -- putStrLn "各縣市平均就醫距離"
-            -- pprint (tier1Avg mapping)
-            --
-            -- putStrLn "各鄉鎮市區平均就醫距離"
-            -- pprint (tier2Avg mapping)
+            let nation = buildUp rows
+            calculateNation nation
+            calculateCounty nation
+            calculateDistrict nation
 
 
-            putStrLn "全國平均就醫距離 (added noise)"
-            addNoise 10 (nationwideAvg mapping) >>= pprint
 
-            -- putStrLn "各縣市平均就醫距離 (added noise)"
-            -- mapM (addNoise scale) (tier1Avg mapping) >>= pprint
-            --
-            -- putStrLn "各鄉鎮市區平均就醫距離 (added noise)"
-            -- mapM (mapM (addNoise scale)) (tier2Avg mapping) >>= pprint
+calculateNation :: District (Vector Row) -> IO ()
+calculateNation nation = do
+    putStrLn "全國平均就醫距離"
+    let header = V.fromList [encodeUtf8 "全國"] :: Vector Name
+    let result = [NationResult (nationAvg nation)]
+    B.writeFile "result/original/nationwide.csv" (encodeByName header result)
 
+    putStrLn "全國平均就醫距離 (added noise)"
 
-        where
+    forM_ [-9 .. 5] $ \level -> do
+        results <- replicateM iteration (nationAddNoise level nation)
+        B.writeFile ("result/pertubated/nationwide/2^" <> show level <> ".csv") (encodeByName header results)
 
-            esp = 0.5 -- e.g. e^0.5 ≈ 1.65× advantage over random guessing
+calculateCounty :: District (Vector Row) -> IO ()
+calculateCounty nation = do
+    putStrLn "各縣市平均就醫距離"
+    let header = V.fromList (map encodeUtf8 (Map.keys nation)) :: Vector Name
+    let avgs = fmap countyAvg nation
+    let result = [CountyResult avgs]
+    B.writeFile "result/original/countywide.csv" (encodeByName header result)
 
-            sensitivity = 100
-
-            scale = sensitivity / esp
-
-
--- 1. 各鄉鎮市區的平均就醫距離
-tier2Avg :: Mapping -> Tier1 Double
-tier2Avg = fmap (fmap (average . V.toList . fmap distance))
-
--- 2. 各縣市的平均就醫距離
-tier1Avg :: Mapping -> Tier2 Double
-tier1Avg = fmap (average . Map.elems) . tier2Avg
-
--- 3. 全國的平均就醫距離
-nationwideAvg :: Mapping -> Double
-nationwideAvg = average . Map.elems . tier1Avg
-
-type Mapping = Tier1 (Vector Row)
--- 全國 > 縣市
-type Tier1 a = Map Text (Tier2 a)
--- 全國 > 縣市 > 鄉鎮市區
-type Tier2 a = Map Text a
+    putStrLn "各縣市平均就醫距離 (added noise)"
 
 
-buildMapping :: Vector Row -> Mapping
-buildMapping = foldl insertTier1 Map.empty
+    forM_ [-4 .. 10] $ \level -> do
+        results <- replicateM iteration (countyAddNoise level nation)
+        B.writeFile ("result/pertubated/countywide/2^" <> show level <> ".csv") (encodeByName header results)
+
+
+calculateDistrict :: District (Vector Row) -> IO ()
+calculateDistrict nation = do
+    let flattened = flatten nation
+    putStrLn "各鄉鎮市區的平均就醫距離"
+    let header = V.fromList $ map encodeUtf8 $ Map.keys flattened
+    let result = [DistrictResult (flatten $ fmap (fmap districtAvg) nation)]
+    B.writeFile "result/original/districtwide.csv" (encodeByName header result)
+
+    putStrLn "各鄉鎮市區的平均就醫距離 (added noise)"
+
+    forM_ [5 .. 20] $ \level -> do
+        results <- replicateM iteration (districtAddNoise level flattened)
+        B.writeFile ("result/pertubated/districtwide/2^" <> show level <> ".csv") (encodeByName header results)
+
+
+nationAddNoise :: Int -> District (Vector Row) -> IO NationResult
+nationAddNoise level nation = do
+    let avg = nationAvg nation
+    pertubated <- addNoise scale avg
+    return (NationResult pertubated)
+    where
+        size = Map.foldl (\s elem -> s + (Map.foldl (\s vec -> s + V.length vec) 0 elem)) 0 nation
+        eps = 2.0 ^^ level
+        scale = 400000.0 / (fromIntegral size * eps)
+            -- pertubated <- addNoise' scale (replicate iteration (nationwideAvg mapping))
+
+countyAddNoise :: Int -> District (Vector Row) -> IO CountyResult
+countyAddNoise level nation = do
+    -- let avgsAssoc = Map.assocs (fmap countyAvg nation)
+    pertubated <- forM (Map.assocs nation) $ \(name, county) -> do
+        let avg = countyAvg county
+        pertubated <- addNoise (scale county) avg
+        return (name, pertubated)
+    return (CountyResult (Map.fromList pertubated))
+
+    where
+        countySize = Map.foldl (\s vec -> s + V.length vec) 0
+        eps = 2.0 ^^ level
+        scale county = 400000.0 / (fromIntegral (countySize county) * eps)
+
+districtAddNoise :: Int -> FlatDistrict (Vector Row) -> IO DistrictResult
+districtAddNoise level flattened = do
+    -- let avgsAssoc = Map.assocs (fmap countyAvg nation)
+    pertubated <- forM (Map.assocs flattened) $ \(name, district) -> do
+        let avg = districtAvg district
+        pertubated <- addNoise (scale district) avg
+        return (name, pertubated)
+    return (DistrictResult (Map.fromList pertubated))
+
+    where
+        districtSize = V.length -- Map.foldl (\s vec -> s + V.length vec) 0
+        eps = 2.0 ^^ level
+        scale district = 400000.0 / (fromIntegral (districtSize district) * eps)
+
+
+
+
+data NationResult = NationResult Double deriving (Show)
+data CountyResult = CountyResult (County Double) deriving (Show)
+data DistrictResult = DistrictResult (FlatDistrict Double) deriving (Show)
+
+instance ToNamedRecord NationResult where
+    toNamedRecord (NationResult value) = namedRecord
+        [ (encodeUtf8 "全國") .= value ]
+
+instance ToNamedRecord CountyResult where
+    toNamedRecord (CountyResult value)
+        = namedRecord (map (\(key, val) -> (encodeUtf8 key) .= val) (Map.assocs value))
+
+flatten :: District a -> FlatDistrict a
+flatten = Map.fromList . concat . map fuseName . Map.toList
+    where
+        fuseName :: (Text, County a) -> [(Text, a)]
+        fuseName (countyName, county) = map (\(districtName, distrct) -> (countyName <> districtName, distrct)) (Map.toList county)
+
+
+instance ToNamedRecord DistrictResult where
+    toNamedRecord (DistrictResult nation)
+        = namedRecord
+            $ Map.elems
+            $ Map.mapWithKey (\name value -> encodeUtf8 name .= value)
+            $ nation
+
+districtAvg :: Vector Row -> Double
+districtAvg = average . V.toList . fmap distance
+
+countyAvg :: County (Vector Row) -> Double
+countyAvg = average . Map.elems . fmap districtAvg
+    -- Map.foldl (\ acc distrct -> acc + districtAvg distrct) 0.0
+
+nationAvg :: District (Vector Row) -> Double
+nationAvg = average . Map.elems . fmap countyAvg
+
+buildUp :: Vector Row -> District (Vector Row)
+buildUp = foldl insertCounty Map.empty
     where
 
-        singletonTier2 :: Row -> Tier2 (Vector Row)
-        singletonTier2 row = Map.singleton (snd (key row)) (V.singleton row)
+        districtSingleton :: Row -> County (Vector Row)
+        districtSingleton row = Map.singleton (snd (key row)) (V.singleton row)
 
-        insertTier1 :: Mapping -> Row -> Mapping
-        insertTier1 m row = Map.insertWith
-            (insertTier2 row)
-            (fst (key row))         -- key for Tier1
-            (singletonTier2 row)    -- key for Tier1 (which is Tier2)
+        insertCounty :: District (Vector Row) -> Row -> District (Vector Row)
+        insertCounty m row = Map.insertWith
+            (insertDistrict row)
+            (fst (key row))         -- key for TierCounty
+            (districtSingleton row)    -- key for TierCounty (which is TierDistrict)
             m
 
-        insertTier2 :: Row -> Tier2 (Vector Row) -> Tier2 (Vector Row) -> Tier2 (Vector Row)
-        insertTier2 row _ old = Map.insertWith
+        insertDistrict :: Row -> County (Vector Row) -> County (Vector Row) -> County (Vector Row)
+        insertDistrict row _ old = Map.insertWith
             (V.++)
-            (snd (key row))         -- key for Tier2
-            (V.singleton row)       -- value for Tier2
+            (snd (key row))         -- key for TierDistrict
+            (V.singleton row)       -- value for TierDistrict
             old
 
         key :: Row -> (Text, Text)
@@ -133,23 +220,10 @@ addNoise scale x = do
     noise <- sampleLaplace scale
     return (x + noise)
 
-sampleLaplaceList :: Double -> Int -> IO [Double]
-sampleLaplaceList scale times = withSystemRandom . asGenST $
-    replicateM times . genContVar (laplace 0 scale)
-
-addNoise' :: Double -> [Double] -> IO [Double]
-addNoise' scale xs = do
-    noise' <- sampleLaplaceList scale (length xs)
-    return $ fmap (uncurry (+)) (zip xs noise')
-
-
-
-
-
--- 研究問題
-
--- 1. 各鄉鎮市區的平均就醫距離
--- 2. 各縣市的平均就醫距離
--- 3. 全國的平均就醫距離
-
--- 距離上限: 400 公里
+-- -- 研究問題
+--
+-- -- 1. 各鄉鎮市區的平均就醫距離
+-- -- 2. 各縣市的平均就醫距離
+-- -- 3. 全國的平均就醫距離
+--
+-- -- 距離上限: 400 公里

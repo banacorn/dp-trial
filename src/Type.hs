@@ -39,8 +39,9 @@ data Row = Row
 pprint :: Pretty a => a -> IO ()
 pprint v = T.putStrLn (display v)
 
-class Pretty a where
+class (Show a) => Pretty a where
     display :: a -> Text
+    display = T.pack . show
 
 instance Pretty Double where
     display x = T.pack (show x)
@@ -79,6 +80,8 @@ instance Pretty Row where
 instance Pretty Text where
     display = id
 
+instance Pretty Int where
+    display = T.pack . show
 instance (Pretty value) => Pretty (Vector value) where
     display = foldl (\xs x -> xs <> "\n" <> x) "" . fmap display
 
