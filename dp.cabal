@@ -24,5 +24,6 @@ executable dp
                 ,   vector
                 ,   statistics
                 ,   mwc-random
+                ,   primitive
                 -- ,   mtl
                 ,   containers

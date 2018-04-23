@@ -13,7 +13,6 @@ import qualified    Data.Map as Map
 import              Data.Map (Map)
 import qualified    Data.Vector as V
 import              Data.Vector (Vector)
-import              Data.Maybe (maybeToList)
 import              Data.Csv
 import              Data.Monoid
 
@@ -21,6 +20,7 @@ import              Parser
 import              Type
 
 import              Control.Monad
+import              Control.Monad.Primitive
 import              System.Random.MWC
 import              Statistics.Distribution
 import              Statistics.Distribution.Laplace
@@ -43,8 +43,6 @@ main = do
             calculateCounty nation
             calculateDistrict nation
 
-
-
 calculateNation :: District (Vector Row) -> IO ()
 calculateNation nation = do
     putStrLn "全國平均就醫距離"
@@ -53,11 +51,10 @@ calculateNation nation = do
     B.writeFile "result/original/nationwide.csv" (encodeByName header result)
 
     putStrLn "全國平均就醫距離 (added noise)"
-
     forM_ [-9 .. 5] $ \level -> do
         results <- replicateM iteration (nationAddNoise level nation)
         B.writeFile ("result/pertubated/nationwide/2^" <> show level <> ".csv") (encodeByName header results)
-
+--
 calculateCounty :: District (Vector Row) -> IO ()
 calculateCounty nation = do
     putStrLn "各縣市平均就醫距離"
@@ -66,13 +63,11 @@ calculateCounty nation = do
     let result = [CountyResult avgs]
     B.writeFile "result/original/countywide.csv" (encodeByName header result)
 
-    putStrLn "各縣市平均就醫距離 (added noise)"
-
-
-    forM_ [-4 .. 10] $ \level -> do
-        results <- replicateM iteration (countyAddNoise level nation)
-        B.writeFile ("result/pertubated/countywide/2^" <> show level <> ".csv") (encodeByName header results)
-
+    withSystemRandom . asGenIO $ \gen -> do
+        putStrLn "各縣市平均就醫距離 (added noise)"
+        forM_ [-4 .. 10] $ \level -> do
+            results <- replicateM iteration (countyAddNoise level nation gen)
+            B.writeFile ("result/pertubated/countywide/2^" <> show level <> ".csv") (encodeByName header results)
 
 calculateDistrict :: District (Vector Row) -> IO ()
 calculateDistrict nation = do
@@ -84,9 +79,10 @@ calculateDistrict nation = do
 
     putStrLn "各鄉鎮市區的平均就醫距離 (added noise)"
 
-    forM_ [5 .. 20] $ \level -> do
-        results <- replicateM iteration (districtAddNoise level flattened)
-        B.writeFile ("result/pertubated/districtwide/2^" <> show level <> ".csv") (encodeByName header results)
+    withSystemRandom . asGenIO $ \gen -> do
+        forM_ [5 .. 20] $ \level -> do
+            results <- replicateM iteration (districtAddNoise level flattened gen)
+            B.writeFile ("result/pertubated/districtwide/2^" <> show level <> ".csv") (encodeByName header results)
 
 
 nationAddNoise :: Int -> District (Vector Row) -> IO NationResult
@@ -100,28 +96,26 @@ nationAddNoise level nation = do
         scale = 400000.0 / (fromIntegral size * eps)
             -- pertubated <- addNoise' scale (replicate iteration (nationwideAvg mapping))
 
-countyAddNoise :: Int -> District (Vector Row) -> IO CountyResult
-countyAddNoise level nation = do
-    -- let avgsAssoc = Map.assocs (fmap countyAvg nation)
-    pertubated <- forM (Map.assocs nation) $ \(name, county) -> do
+countyAddNoise :: Int -> District (Vector Row) -> Gen (PrimState IO) -> IO CountyResult
+countyAddNoise level nation gen = do
+    pertubated <- mapM (\county -> do
         let avg = countyAvg county
-        pertubated <- addNoise (scale county) avg
-        return (name, pertubated)
-    return (CountyResult (Map.fromList pertubated))
+        noise <- genContVar (laplace 0 (scale county)) gen
+        return (avg + noise)) nation
+    return (CountyResult pertubated)
 
     where
         countySize = Map.foldl (\s vec -> s + V.length vec) 0
         eps = 2.0 ^^ level
         scale county = 400000.0 / (fromIntegral (countySize county) * eps)
 
-districtAddNoise :: Int -> FlatDistrict (Vector Row) -> IO DistrictResult
-districtAddNoise level flattened = do
-    -- let avgsAssoc = Map.assocs (fmap countyAvg nation)
-    pertubated <- forM (Map.assocs flattened) $ \(name, district) -> do
+districtAddNoise :: Int -> FlatDistrict (Vector Row) -> Gen (PrimState IO) -> IO DistrictResult
+districtAddNoise level flattened gen = do
+    pertubated <- mapM (\district -> do
         let avg = districtAvg district
-        pertubated <- addNoise (scale district) avg
-        return (name, pertubated)
-    return (DistrictResult (Map.fromList pertubated))
+        noise <- genContVar (laplace 0 (scale district)) gen
+        return (avg + noise)) flattened
+    return (DistrictResult pertubated)
 
     where
         districtSize = V.length -- Map.foldl (\s vec -> s + V.length vec) 0
@@ -144,10 +138,10 @@ instance ToNamedRecord CountyResult where
         = namedRecord (map (\(key, val) -> (encodeUtf8 key) .= val) (Map.assocs value))
 
 flatten :: District a -> FlatDistrict a
-flatten = Map.fromList . concat . map fuseName . Map.toList
+flatten = Map.fromList . concat . map fuseName . Map.assocs
     where
         fuseName :: (Text, County a) -> [(Text, a)]
-        fuseName (countyName, county) = map (\(districtName, distrct) -> (countyName <> districtName, distrct)) (Map.toList county)
+        fuseName (countyName, county) = map (\(districtName, distrct) -> (countyName <> districtName, distrct)) (Map.assocs county)
 
 
 instance ToNamedRecord DistrictResult where
