@@ -155,11 +155,12 @@ districtAvg :: Vector Row -> Double
 districtAvg = average . V.toList . fmap distance
 
 countyAvg :: County (Vector Row) -> Double
-countyAvg = average . Map.elems . fmap districtAvg
+countyAvg = average . concat . Map.elems . fmap (V.toList . fmap distance)
+    -- average . Map.elems . fmap districtAvg
     -- Map.foldl (\ acc distrct -> acc + districtAvg distrct) 0.0
 
 nationAvg :: District (Vector Row) -> Double
-nationAvg = average . Map.elems . fmap countyAvg
+nationAvg = average . concat . Map.elems . fmap (concat . Map.elems . fmap (V.toList . fmap distance))
 
 buildUp :: Vector Row -> District (Vector Row)
 buildUp = foldl insertCounty Map.empty
